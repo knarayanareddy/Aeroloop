@@ -1,6 +1,4 @@
-Part 1 of 3 — covering the constitutional layer, agent registry, programme overview, global architecture, and data model.
 
-Markdown
 
 # Aeroloopspec.md
 # AeroLoop — Autonomous CFD Wing Optimisation System
@@ -944,19 +942,6 @@ PRE-SEEDED KNOWN INTERACTIONS (seed the knowledge graph at run init)
 (winglet_height_m, span_m)       — synergistic (effective span)
 
 These are confidence=0.3 seed entries; real data overwrites them.
-Part 1 is complete. It covers:
-
-✅ CLAUDE.md — all 12 constitutional rules, fully consistent (RULE-003 now says git checkout, RULE-060 and RULE-061 are the single canonical commit formats, no duplicate/conflicting formats)
-✅ AGENTS.md — full agent registry with corrected tool name (git_checkout_restore, not git_revert); BullMQ queue layout; GEP population=16 stated in the agent descriptions to seed consistency
-✅ program.md — stack declared as Bun + Hono (no FastAPI/Hono slash ambiguity); roadmap with Phase 0–5 and milestone gates; GEP population=16 in Phase 3 deliverables
-✅ GLOBAL-ARCH-001 — data flow, component map, throughput targets
-✅ GLOBAL-DM-001 — complete SQL schema including the missing genomes table, all 6 tables, append-only trigger, indexes
-✅ GLOBAL-GEOM-001 — full parameter registry with all categories + cross-parameter constraints + pre-seeded interactions
-
-
-
-
-Part 2 of 3 — covering all global specification files and Stages 0 through 5.
 
 Markdown
 
@@ -3024,28 +3009,8 @@ AC-5-006: Dirty tree guard
       of the next experiment
   [ ] LOOP_HALT_DIRTY_TREE event emitted with list of dirty files
   [ ] Loop does not attempt mutation while dirty
-Part 2 is complete. It covers:
-
-✅ GLOBAL-API-001 — Full API contracts for all 7 endpoint groups (Health, Runs, Experiments, Knowledge Graph, Wiki, Swarm, Operator) with request/response schemas, validation rules, and error contracts
-✅ GLOBAL-MSG-001 — Complete MessageType enum (all 9 stages, 47 message types), Stage enum, LoopMessage base type, BullMQ queue layout, and Redis key schema
-✅ GLOBAL-METRIC-001 — Full metric formula (standard + fallback), weight constraints, wave drag computation (primary + fallback), sanity bounds, metric versioning
-✅ GLOBAL-MESH-001 — Complete quality gate table, mesh level targets, quality report file format
-✅ GLOBAL-ENV-001 — Complete Zod environment schema with all variables, types, defaults, and local dev .env template
-✅ GLOBAL-COMMIT-001 — Hook implementation code for pre-commit and commit-msg; S3 path conventions
-✅ GLOBAL-LOG-001 — Required fields on every log line, full event table with required context fields, decision log format, retention policy
-✅ GLOBAL-TEST-001 — Testing principles, tooling, coverage thresholds, naming convention, full IT-001–IT-006 integration test specs
-✅ Stage 0 — Full FR + AC (run init, baseline pipeline, M_best seeding, git setup, KG seeding, hook verification)
-✅ Stage 1 — Full FR + AC (context reading, single mutation law, anti-repetition, dead zone avoidance, detect-impact, bounds validation, geometry write, swarm region guard)
-✅ Stage 2 — Full FR + AC (level selection, y+ targeting, GMSH pipeline, quality gate, S3 upload + integrity)
-✅ Stage 3 — Full FR + AC (solve lock, config generation, dual kill timers, convergence check, results upload, alpha sweep)
-✅ Stage 4 — Full FR + AC (download + verify, coefficient extraction, derived quantities, buffet detection, sanity checks, metric computation, provenance)
-✅ Stage 5 — Full FR + AC (beat-the-best decision, KEEP path, REVERT path using git checkout not git revert, append-only record insert, consecutive failure pause, dirty tree guard)
 
 
-
-
-
-Part 3 of 3 — covering Stages 6 through 9, infrastructure, the operator runbook, open items, and the changelog.
 
 Markdown
 
@@ -4735,15 +4700,4 @@ Version  Date        Author             Changes
                                         - "What was completed & why"
                                           section removed (was not spec
                                           content; was assistant output)
-Part 3 is complete. Here is a summary of everything covered:
-
-✅ Stage 6 — Wiki — Full FR + AC: trigger model, sensitivity articles (with anti-vagueness rule), batch summary, interaction articles, topology articles, KG summary update, DB write, git commit
-✅ Stage 7 — Knowledge Graph — Full FR + AC: raw observation insert, sensitivity distribution update, dead zone detection + clearing, hot zone detection + clearing, Mann–Whitney U interaction discovery, detect-impact implementation, GPR surrogate training
-✅ Stage 8 — GEP — Full FR + AC: population=16, elites=top-2, selection breakdown 2+4+8+2=16 (consistent throughout), genome schema, fitness (history-only), crossover (uniform), single-gene mutation bounds, checkpoint recovery, 11 acceptance criteria covering every FR
-✅ Stage 9 — Swarm — Full FR + AC: node identity, registration, heartbeat, 8-region partition table, SETNX claim protocol, region validation guard, shared registry push, global best M sync, OFFLINE_MODE + reconnect, conflict resolution, clean shutdown, dashboard feed
-✅ GLOBAL-INFRA-001 — Complete monorepo tree (every file named), Docker Compose services table, CI pipeline (6 jobs), release pipeline, Turborepo turbo.json
-✅ OPERATOR-001 — First-time setup, single-node start, swarm start, all CLI commands, 6 incident recovery procedures with exact commands, nightly checklist
-✅ GLOBAL-OPEN-001 — 11 open items with resolution proposals
-✅ GLOBAL-CHANGELOG — Full history from v0.1 to v1.0 with every consistency fix catalogued
-
 
