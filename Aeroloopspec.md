@@ -3316,3 +3316,1993 @@ tests:
     expected:
       new_experiments_during_gep: 0
       
+
+
+
+
+
+Markdown
+
+<!-- ============================================================ -->
+<!-- CONTINUATION OF Aeroloopspec.md — all sections below are    -->
+<!-- completions of the spec-driven architecture from Stage 8    -->
+<!-- acceptance criteria onward.                                  -->
+<!-- ============================================================ -->
+
+───────────────────────────────────────────────────────────────────
+## STAGE-8-GEP — ACCEPTANCE CRITERIA
+───────────────────────────────────────────────────────────────────
+
+### AC-GEP-001 — Trigger & Pause
+- [ ] Loop pauses cleanly at exactly experiment_n % 500 === 0 before
+      the next mutation proposal begins.
+- [ ] A `GEP_EVOLUTION_START` message is emitted to the message bus
+      before any genome operation runs.
+- [ ] Operator is notified via the configured notification channel
+      (webhook/email/Slack) with: run_id, current experiment_n,
+      current best M, and current genome summary.
+- [ ] No new CFD jobs are dispatched while GEP evolution is active.
+- [ ] If GEP evolution fails (any unhandled exception), the current
+      genome is preserved unchanged, a `GEP_EVOLUTION_FAILED` event
+      is emitted, and the loop resumes with the unchanged genome.
+
+### AC-GEP-002 — Genome Persistence
+- [ ] Current genome is serialised to
+      `.aeroloop/genome/current_genome.json` before evaluation.
+- [ ] Each evolved generation is written to
+      `.aeroloop/genome/generation_{N}.json` (N = generation counter).
+- [ ] Genome files are committed to git with message
+      `chore(gep): generation {N} evolved at exp {experiment_n}`.
+- [ ] Schema of genome file is validated against
+      `GeomeGenome` Zod schema before write; invalid genome halts GEP
+      and retains previous.
+
+### AC-GEP-003 — Fitness Evaluation (history-only, no new CFD)
+- [ ] Fitness of each candidate genome is computed purely from the
+      ExperimentRegistry using improvement_rate_per_100_experiments
+      and keep_ratio over the last 500 experiments.
+- [ ] No new mesh or solve jobs are created during GEP evaluation.
+- [ ] Fitness scores are logged per candidate in
+      `.aeroloop/genome/gep_eval_{generation}.jsonl`.
+
+### AC-GEP-004 — Selection, Mutation, Crossover
+- [ ] Population size is exactly 12 candidates.
+- [ ] Top-3 by fitness survive unchanged (elitism).
+- [ ] Remaining 9 are filled by crossover (4 pairs from top-6) and
+      single-gene mutation (remaining slots).
+- [ ] Crossover uses uniform crossover on numeric genes; strategy gene
+      inherits from the fitter parent.
+- [ ] Mutation magnitude is bounded: step_size_multiplier ∈ [0.5, 3.0],
+      patience ∈ [3, 30], topology_probability ∈ [0.0, 0.15].
+- [ ] Selected genome is written to `current_genome.json` and a
+      `GEP_EVOLUTION_COMPLETE` message is emitted with before/after
+      genome diff.
+
+### AC-GEP-005 — Topology Macro-Mutation Guard
+- [ ] When the evolved genome sets topology_probability > 0.05 for the
+      first time in this run, a `TOPOLOGY_ENABLED` warning event is
+      emitted and logged.
+- [ ] Any experiment executed under topology_probability > 0 must set
+      experiment.topology_mutation = true in its registry record.
+- [ ] Topology mutations (winglet add/remove, airfoil family change)
+      must be logged in a dedicated section of the wiki with before/
+      after geometry SHA256 and metric delta.
+
+### AC-GEP-006 — Resume Safety
+- [ ] On cold restart mid-GEP, the system detects incomplete GEP state
+      via `gep_in_progress` flag in ExperimentRun and re-runs GEP from
+      the last completed checkpoint before resuming the loop.
+- [ ] GEP checkpoints are written after each of: evaluation, selection,
+      mutation/crossover, write.
+
+---
+
+───────────────────────────────────────────────────────────────────
+## STAGE-9 — SWARM COORDINATION
+### File: specs/stage-9/requirements.md
+───────────────────────────────────────────────────────────────────
+
+### Purpose
+Enable N ≥ 2 AeroLoop nodes to search the geometry design space
+concurrently without duplicating effort, without race conditions on
+`wing.geo`, and with shared learning via a central knowledge graph and
+ExperimentRegistry. Each node is fully autonomous; the swarm layer
+is coordination-only and must never block a node's core loop for
+more than 5 seconds.
+
+### Constitutional constraints (swarm-specific)
+The global CLAUDE.md swarm non-collision law applies. Additional
+constraints:
+  - A node must NEVER read or write another node's `wing.geo`.
+  - Swarm coordination is best-effort: a node that cannot reach
+    the coordination service within 5 s proceeds independently and
+    marks its claim as `OFFLINE_MODE`.
+  - All shared state lives in Redis (claims, counters, locks).
+    PostgreSQL is the source of truth for results.
+  - A node's core loop invariants (kill timer, git integrity, single
+    mutable file) take absolute precedence over any swarm directive.
+
+---
+
+### STAGE-9-FR-001 — Node Identity & Registration
+
+**FR-9-001.1** Each node has a stable `node_id` (UUID v4) generated
+on first start and persisted to `.aeroloop/node_id`.
+
+**FR-9-001.2** On startup, each node calls `POST /api/v1/swarm/nodes`
+with its node_id, run_id, hostname, and capabilities (core_count,
+memory_gb, gpu_available).
+
+**FR-9-001.3** Node heartbeat: `PATCH /api/v1/swarm/nodes/{node_id}`
+every 30 s with current experiment_n, current best M, and status
+(IDLE | SOLVING | GEP | OFFLINE).
+
+**FR-9-001.4** A node missing 3 consecutive heartbeats is marked
+STALE by the coordinator. Its region claims are released after
+a 10-minute grace period to allow for transient network issues.
+
+**FR-9-001.5** On clean shutdown, node calls
+`DELETE /api/v1/swarm/nodes/{node_id}` which releases all claims.
+
+---
+
+### STAGE-9-FR-002 — Design Region Partitioning
+
+**FR-9-002.1** The design space is partitioned into a flat list of
+**regions**. A region is defined as a named slice of the parameter
+registry (e.g., `PLANFORM_SWEEP`, `TWIST_DISTRIBUTION`,
+`WINGLET_GEOMETRY`, `THICKNESS_CAMBER`).
+
+**FR-9-002.2** Default region list (8 regions):
+REGION_PLANFORM_CORE span, AR, taper, chords, MAC REGION_PLANFORM_SWEEP LE_sweep, TE_sweep, dihedral REGION_TWIST twist_root → twist_tip (all stations) REGION_THICKNESS t/c at all span stations REGION_CAMBER camber at all span stations REGION_LE_SHAPING LE radius distribution REGION_WINGLET all winglet parameters (gated by topology) REGION_GLOBAL any parameter (used for global search strategy)
+
+text
+
+
+**FR-9-002.3** A node claims a region via atomic Redis SETNX:
+Key: aeroloop:{run_id}:region:{region_name}:owner Value: {node_id} TTL: 600 s (renewed every heartbeat while active)
+
+text
+
+Claim succeeds only if key does not exist (SETNX). Failure means
+another node owns that region; try next preferred region.
+
+**FR-9-002.4** Region preference order is determined by the node's
+genome strategy:
+  - `fine_search` strategy → prefer REGION_PLANFORM_CORE first
+  - `twist_focus` strategy → prefer REGION_TWIST first
+  - `global` strategy → claim REGION_GLOBAL (overrides all)
+  - No preference match → round-robin from unclaimed regions
+
+**FR-9-002.5** A node may hold at most 2 region claims simultaneously
+(one active, one pre-claimed for next batch).
+
+**FR-9-002.6** Within a claimed region, the node's GeometryMutationAgent
+must only propose mutations for parameters in that region's parameter
+list. Proposals outside the claimed region are rejected by the swarm
+guard and trigger a region re-claim.
+
+---
+
+### STAGE-9-FR-003 — Shared Knowledge Sync
+
+**FR-9-003.1** After every KEEP or REVERT decision, a node pushes its
+experiment summary to the shared ExperimentRegistry via:
+POST /api/v1/experiments
+
+text
+
+with full ExperimentRecord payload (see GLOBAL-DM-001).
+
+**FR-9-003.2** Before each mutation proposal, a node fetches the
+latest knowledge graph summary for its claimed region:
+GET /api/v1/knowledge-graph/summary?region={region}&node_id={node_id}
+
+text
+
+Response must arrive within 3 s; on timeout node uses its local
+cached summary (max staleness: 10 minutes).
+
+**FR-9-003.3** Knowledge graph updates from all nodes are merged
+by the coordinator using a last-write-wins strategy per
+(parameter_id, metric) pair with logical timestamp.
+
+**FR-9-003.4** Global best metric `M_best` is stored in Redis:
+Key: aeroloop:{run_id}:global_best_M Value: float (serialised as string)
+
+text
+
+A node updates this via Redis GETSET only when its local keep
+produces a new run-wide best. The keep/revert decision uses the
+node's own local best for autonomy, but also checks global best
+for cross-node learning.
+
+**FR-9-003.5** A node's GEP evolver (Stage 8) reads the shared
+ExperimentRegistry (not just local experiments) when computing
+fitness, ensuring cross-node improvement history informs genome
+evolution.
+
+---
+
+### STAGE-9-FR-004 — Swarm Progress Dashboard Feed
+
+**FR-9-004.1** The coordinator exposes a Server-Sent Events (SSE)
+stream at:
+GET /api/v1/swarm/stream?run_id={run_id}
+
+text
+
+Emitting events: NODE_HEARTBEAT, EXPERIMENT_KEPT, EXPERIMENT_REVERTED,
+REGION_CLAIMED, REGION_RELEASED, GLOBAL_BEST_UPDATED, NODE_STALE,
+GEP_EVOLUTION_START, GEP_EVOLUTION_COMPLETE.
+
+**FR-9-004.2** The dashboard app (`apps/dashboard`) consumes this
+SSE stream and renders:
+  - Active nodes (id, status, current region, local best M)
+  - Global best M over time (line chart, all nodes combined)
+  - Region heatmap (which node owns which region, claim age)
+  - Per-node experiment rate (experiments/hour, rolling 1h)
+  - Global experiment log (last 50 events, across all nodes)
+
+**FR-9-004.3** Dashboard is read-only; it has no ability to issue
+commands to nodes (operator commands use the CLI, see OPERATOR-001).
+
+---
+
+### STAGE-9-FR-005 — Swarm Failure Modes
+
+**FR-9-005.1** If the coordinator is unreachable, nodes enter
+`OFFLINE_MODE` and continue their loop independently. On reconnect,
+they push any accumulated experiment records in chronological order.
+
+**FR-9-005.2** Region claim collisions (two nodes somehow acquiring
+the same region due to Redis partition) are resolved on heartbeat:
+the node with the lexicographically smaller node_id retains the claim;
+the other releases and re-claims a different region.
+
+**FR-9-005.3** If all 8 regions are claimed, a node waits up to
+60 s polling for a free region, then claims REGION_GLOBAL as a
+fallback (no exclusivity guarantee in this mode; logged as warning).
+
+**FR-9-005.4** A STALE node's claims are not immediately reassigned;
+the grace period prevents thrashing when a node has a slow solve.
+
+---
+
+### STAGE-9 — ACCEPTANCE CRITERIA
+
+#### AC-SWARM-001 — Non-Collision
+- [ ] With 4 nodes running simultaneously, no two nodes ever write
+      `wing.geo` concurrently. Verified by git log cross-node merge
+      showing zero conflicts in 500-experiment integration test.
+- [ ] Redis SETNX claim is acquired before every mutation write and
+      held until git KEEP/REVERT completes.
+
+#### AC-SWARM-002 — Node Registration & Heartbeat
+- [ ] Node registers on startup within 3 s of first loop iteration.
+- [ ] Heartbeat fires every 30 ± 2 s.
+- [ ] Node marked STALE within 95 s of last heartbeat (3 × 30 + grace).
+- [ ] Clean shutdown releases claims within 2 s.
+
+#### AC-SWARM-003 — Region Partitioning
+- [ ] With 4 nodes, at least 3 distinct regions are active
+      simultaneously within 5 experiments of startup.
+- [ ] No node proposes a mutation outside its claimed region for
+      > 0 experiments in a 1000-experiment integration test.
+- [ ] REGION_GLOBAL fallback is logged and flagged in dashboard.
+
+#### AC-SWARM-004 — Knowledge Sync
+- [ ] A KEEP on node-A is visible to node-B's knowledge graph
+      summary within 2 heartbeat cycles (≤ 60 s).
+- [ ] Global best M is updated in Redis within 5 s of a cross-node
+      best-improvement event.
+- [ ] OFFLINE_MODE sync reconciliation produces no duplicate
+      experiment_n entries in the shared registry.
+
+#### AC-SWARM-005 — Dashboard
+- [ ] SSE stream emits events with latency < 500 ms from event
+      occurrence.
+- [ ] Dashboard renders with no stale data older than 35 s.
+- [ ] Dashboard is accessible with no login in development mode;
+      requires bearer token in production mode.
+
+#### AC-SWARM-006 — Failure Resilience
+- [ ] Coordinator restart (simulated) does not halt any node's loop.
+- [ ] Region collision resolution converges within 2 heartbeat cycles.
+- [ ] OFFLINE_MODE accumulation test: node offline for 50 experiments,
+      reconnects, all 50 records appear in shared registry in order
+      with no registry constraint violations.
+
+---
+
+───────────────────────────────────────────────────────────────────
+## GLOBAL-API-001 — API CONTRACT SPECIFICATION
+### File: specs/_global/api-contracts.md
+───────────────────────────────────────────────────────────────────
+
+### Conventions
+- Base URL (local dev): `http://localhost:4000/api/v1`
+- Base URL (production): `https://aeroloop.internal/api/v1`
+- All requests and responses: `Content-Type: application/json`
+- Authentication: Bearer JWT (header: `Authorization: Bearer {token}`)
+  except `/health` and SSE stream in dev mode.
+- All timestamps: ISO 8601 UTC string (`2025-01-15T14:32:00.000Z`)
+- All errors follow RFC 7807 Problem Details:
+  ```json
+  {
+    "type": "https://aeroloop.internal/errors/{code}",
+    "title": "Human readable title",
+    "status": 422,
+    "detail": "Specific detail string",
+    "instance": "/api/v1/experiments/42"
+  }
+Pagination: cursor-based via ?after={cursor}&limit={n} (max 200).
+Rate limiting: 1000 req/min per node_id; 429 on breach.
+API-001: Health
+GET /health
+Returns system health. No auth required.
+
+Response 200:
+
+JSON
+
+{
+  "status": "ok",
+  "db": "ok",
+  "redis": "ok",
+  "s3": "ok",
+  "version": "1.0.0",
+  "uptime_s": 3600
+}
+Response 503: any dependency unhealthy; body same shape with failing service set to "degraded" or "down".
+
+API-002: Experiment Runs
+POST /runs
+Create and lock a new ExperimentRun. Called by loop orchestrator at Stage 0 init.
+
+Request body:
+
+JSON
+
+{
+  "node_id": "uuid-v4",
+  "run_label": "naca0012-baseline-run-1",
+  "metric_weights": {
+    "w_ld": 0.5,
+    "w_buffet": 0.3,
+    "w_wave_drag": 0.2
+  },
+  "operating_conditions": {
+    "mach": 0.78,
+    "reynolds": 4.5e7,
+    "alpha_cruise": 2.5,
+    "altitude_m": 11000
+  },
+  "solver_config": {
+    "solver": "SU2",
+    "version": "7.5.1",
+    "cfl_number": 10.0,
+    "max_iter": 3000,
+    "convergence_cauchy_eps": 1e-6,
+    "mpi_ranks": 8,
+    "wall_time_limit_s": 480
+  },
+  "mesh_config": {
+    "mesher": "GMSH",
+    "version": "4.11.1",
+    "default_level": "medium",
+    "y_plus_target": 1.0
+  },
+  "swarm_enabled": false,
+  "gep_enabled": true
+}
+Response 201:
+
+JSON
+
+{
+  "run_id": "uuid-v4",
+  "created_at": "2025-01-15T14:00:00.000Z",
+  "status": "INITIALISING",
+  "baseline_experiment_id": null
+}
+Errors: 422 if metric_weights do not sum to 1.0 ± 0.001; 409 if node_id already has an active run.
+
+GET /runs/{run_id}
+Returns full ExperimentRun record including current stats.
+
+Response 200:
+
+JSON
+
+{
+  "run_id": "uuid-v4",
+  "status": "RUNNING",
+  "total_experiments": 143,
+  "kept_count": 41,
+  "reverted_count": 102,
+  "best_M": 0.8821,
+  "best_experiment_n": 138,
+  "current_genome": { "...genome fields..." },
+  "created_at": "...",
+  "updated_at": "..."
+}
+PATCH /runs/{run_id}
+Update run status. Used by orchestrator to mark PAUSED, COMPLETED, FAILED.
+
+Request body:
+
+JSON
+
+{ "status": "PAUSED", "reason": "operator_halt" }
+Valid status transitions:
+
+INITIALISING → RUNNING
+RUNNING → PAUSED | COMPLETED | FAILED
+PAUSED → RUNNING | COMPLETED
+API-003: Experiments
+POST /experiments
+Append a new experiment record. Append-only; no PUT/DELETE.
+
+Request body: full ExperimentRecord schema (see GLOBAL-DM-001). Required fields: run_id, experiment_n, node_id, mutation, status, geometry_sha256_before.
+
+Response 201:
+
+JSON
+
+{ "experiment_id": "uuid-v4", "experiment_n": 144 }
+Errors:
+
+409 if (run_id, experiment_n) already exists.
+422 if experiment_n is not exactly max(experiment_n)+1 for this run_id (monotonicity enforced at DB level).
+GET /experiments/{run_id}
+List experiments for a run. Supports pagination and filtering.
+
+Query params:
+
+?status=KEPT — filter by status
+?after={experiment_n}&limit=50 — cursor pagination
+?node_id={node_id} — filter by node (swarm use)
+?sort=desc — reverse chronological (default: asc)
+Response 200:
+
+JSON
+
+{
+  "data": [ { "...ExperimentRecord..." } ],
+  "next_cursor": 195,
+  "total": 144
+}
+GET /experiments/{run_id}/{experiment_n}
+Single experiment record.
+
+Response 200: full ExperimentRecord with all stage results.
+
+API-004: Knowledge Graph
+GET /knowledge-graph/summary
+Return parameter sensitivity + interaction summary for a region or parameter set.
+
+Query params:
+
+?region=REGION_PLANFORM_CORE — filter by swarm region
+?parameter_ids=span,taper_ratio — filter by specific params
+?node_id={node_id} — used for logging/audit
+?run_id={run_id} — scoped to a run (default: global)
+Response 200:
+
+JSON
+
+{
+  "generated_at": "2025-01-15T15:00:00.000Z",
+  "parameters": [
+    {
+      "parameter_id": "span",
+      "sensitivity_score": 0.72,
+      "direction": "positive",
+      "confidence": 0.85,
+      "sample_count": 38,
+      "dead_zone": false,
+      "hot_zone": true
+    }
+  ],
+  "interactions": [
+    {
+      "param_a": "span",
+      "param_b": "taper_ratio",
+      "interaction_strength": 0.61,
+      "p_value": 0.031,
+      "direction": "synergistic"
+    }
+  ],
+  "summary_markdown_path": ".aeroloop/knowledge_graph_summary.md"
+}
+POST /knowledge-graph/update
+Push a post-experiment knowledge graph update. Called by KnowledgeGraphAgent after every experiment.
+
+Request body:
+
+JSON
+
+{
+  "run_id": "uuid-v4",
+  "experiment_n": 144,
+  "node_id": "uuid-v4",
+  "parameter_id": "taper_ratio",
+  "delta_value": -0.03,
+  "delta_M": 0.0041,
+  "outcome": "KEPT",
+  "mesh_quality_ok": true
+}
+Response 204: no body.
+
+POST /knowledge-graph/detect-impact
+Pre-mutation impact assessment. Called by GeometryMutationAgent before writing wing.geo.
+
+Request body:
+
+JSON
+
+{
+  "run_id": "uuid-v4",
+  "node_id": "uuid-v4",
+  "proposed_mutation": {
+    "parameter_id": "le_sweep_inboard",
+    "current_value": 27.5,
+    "proposed_value": 29.1,
+    "delta": 1.6
+  }
+}
+Response 200:
+
+JSON
+
+{
+  "mesh_risk": "LOW",
+  "mesh_risk_reason": null,
+  "known_interactions": [
+    { "with_parameter": "taper_ratio", "strength": 0.61 }
+  ],
+  "dead_zone": false,
+  "hot_zone": false,
+  "similar_experiments": [
+    { "experiment_n": 98, "delta": 1.4, "outcome": "KEPT", "delta_M": 0.002 }
+  ],
+  "recommendation": "PROCEED",
+  "confidence": 0.79,
+  "warning": null
+}
+Possible mesh_risk values: LOW | MEDIUM | HIGH. recommendation: PROCEED | PROCEED_WITH_CAUTION | SKIP. Agent must log HIGH mesh_risk and may skip mutation if recommendation is SKIP (not required to skip; must log decision).
+
+API-005: Wiki
+GET /wiki/articles
+List wiki articles.
+
+Query params:
+
+?type=SENSITIVITY|BATCH_SUMMARY|INTERACTION|TOPOLOGY — filter
+?parameter_id=span — articles referencing a parameter
+?after={article_id}&limit=20
+Response 200:
+
+JSON
+
+{
+  "data": [
+    {
+      "article_id": "uuid-v4",
+      "title": "Parameter Sensitivity: span",
+      "type": "SENSITIVITY",
+      "experiment_range": [100, 110],
+      "created_at": "...",
+      "path": ".aeroloop/wiki/sensitivity_span_exp100_110.md"
+    }
+  ],
+  "next_cursor": "uuid-v4"
+}
+GET /wiki/articles/{article_id}
+Returns article metadata and full markdown body.
+
+Response 200:
+
+JSON
+
+{
+  "article_id": "uuid-v4",
+  "title": "...",
+  "body_markdown": "# Parameter Sensitivity: span\n...",
+  "referenced_experiments": [100, 101, 102, 108, 110],
+  "referenced_parameters": ["span", "taper_ratio"]
+}
+API-006: Swarm
+POST /swarm/nodes
+Register a node. (Full schema in STAGE-9-FR-001.)
+
+PATCH /swarm/nodes/{node_id}
+Heartbeat update.
+
+DELETE /swarm/nodes/{node_id}
+Deregister and release claims.
+
+GET /swarm/nodes
+List all active nodes for a run.
+
+Query params: ?run_id={run_id}&status=ACTIVE
+
+Response 200:
+
+JSON
+
+{
+  "data": [
+    {
+      "node_id": "uuid-v4",
+      "status": "SOLVING",
+      "current_region": "REGION_TWIST",
+      "local_best_M": 0.871,
+      "experiment_n": 143,
+      "last_heartbeat": "2025-01-15T15:01:00.000Z"
+    }
+  ]
+}
+GET /swarm/regions
+List all regions and their current claim status.
+
+Response 200:
+
+JSON
+
+{
+  "regions": [
+    {
+      "region_name": "REGION_PLANFORM_CORE",
+      "owner_node_id": "uuid-v4",
+      "claimed_at": "2025-01-15T14:55:00.000Z",
+      "ttl_remaining_s": 341
+    },
+    {
+      "region_name": "REGION_TWIST",
+      "owner_node_id": null,
+      "claimed_at": null,
+      "ttl_remaining_s": null
+    }
+  ]
+}
+GET /swarm/stream
+SSE stream. (Full spec in STAGE-9-FR-004.)
+
+Event format:
+
+text
+
+event: EXPERIMENT_KEPT
+data: {"run_id":"...","experiment_n":144,"node_id":"...","delta_M":0.004,"M_new":0.882,"timestamp":"..."}
+API-007: Operator Commands
+POST /operator/pause
+Pause the loop on one or all nodes.
+
+Request body:
+
+JSON
+
+{ "run_id": "uuid-v4", "node_id": "uuid-v4|ALL", "reason": "manual_review" }
+Response 202: accepted; nodes will pause after current experiment completes (not mid-stage).
+
+POST /operator/resume
+Resume paused nodes.
+
+Request body:
+
+JSON
+
+{ "run_id": "uuid-v4", "node_id": "uuid-v4|ALL" }
+POST /operator/abort-experiment
+Abort the current experiment on a node. The kill timer fires immediately; geometry is reverted; experiment is recorded as ABORTED.
+
+JSON
+
+{ "run_id": "uuid-v4", "node_id": "uuid-v4" }
+Response 202.
+
+GET /operator/status
+Returns full system status: all runs, all nodes, global best, queue depths, Redis/DB/S3 health.
+
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-INFRA-001 — INFRASTRUCTURE & CI/CD SPECIFICATION
+File: specs/_global/infra.md
+───────────────────────────────────────────────────────────────────
+
+INFRA-001 — Monorepo Directory Specification (complete)
+text
+
+aeroloop/
+│
+├── packages/                         # Shared libraries (no apps here)
+│   ├── types/                        # Zod schemas + TypeScript types
+│   │   ├── src/
+│   │   │   ├── experiment.ts         # ExperimentRun, ExperimentRecord
+│   │   │   ├── genome.ts             # GeneticGenome, GenomeGene
+│   │   │   ├── knowledge-graph.ts    # Sensitivity, Interaction, DetectImpact
+│   │   │   ├── geometry.ts           # ParameterRegistry, BoundsCheck
+│   │   │   ├── messages.ts           # LoopMessage, MessageType enum
+│   │   │   ├── swarm.ts              # NodeRecord, RegionClaim
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   ├── db/                           # Database client + Drizzle schema
+│   │   ├── src/
+│   │   │   ├── schema/
+│   │   │   │   ├── runs.ts
+│   │   │   │   ├── experiments.ts
+│   │   │   │   ├── knowledge-graph.ts
+│   │   │   │   └── wiki.ts
+│   │   │   ├── client.ts
+│   │   │   ├── migrations/
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   ├── redis/                        # Redis client + key helpers
+│   │   ├── src/
+│   │   │   ├── client.ts
+│   │   │   ├── keys.ts               # All Redis key templates centralised here
+│   │   │   ├── swarm-claims.ts       # SETNX claim helpers
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   ├── s3/                           # S3 client + upload/download helpers
+│   │   ├── src/
+│   │   │   ├── client.ts
+│   │   │   ├── mesh.ts               # Mesh upload/download with SHA256
+│   │   │   ├── results.ts            # Solver output upload/download
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   ├── geometry/                     # Geometry utilities
+│   │   ├── src/
+│   │   │   ├── parameter-registry.ts # Full registry + bounds
+│   │   │   ├── bounds-checker.ts
+│   │   │   ├── wing-geo-parser.ts    # Read/write wing.geo
+│   │   │   ├── sha256.ts
+│   │   │   └── index.ts
+│   │   ├── tests/
+│   │   └── package.json
+│   │
+│   ├── meshing/                      # GMSH pipeline wrapper
+│   │   ├── src/
+│   │   │   ├── auto-mesh.ts          # Calls auto_mesh.py via child_process
+│   │   │   ├── quality-checker.ts
+│   │   │   ├── templates/            # GMSH template .geo files per level
+│   │   │   └── index.ts
+│   │   ├── python/
+│   │   │   └── auto_mesh.py
+│   │   └── package.json
+│   │
+│   ├── solver/                       # SU2 runner + kill timer
+│   │   ├── src/
+│   │   │   ├── su2-runner.ts         # Config templating + mpirun + dual timeout
+│   │   │   ├── convergence-checker.ts
+│   │   │   ├── config-templates/     # SU2 cfg templates per solver type
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   ├── extraction/                   # CFD results extraction
+│   │   ├── src/
+│   │   │   ├── polar-extractor.ts    # Parse surface_*.csv
+│   │   │   ├── wave-drag.ts          # Wave drag decomposition
+│   │   │   ├── buffet-detection.ts   # Alpha sweep slope analysis
+│   │   │   ├── metric-computer.ts    # Composite M computation
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   ├── git-ops/                      # Git keep/revert primitives
+│   │   ├── src/
+│   │   │   ├── keeper.ts             # Stage commit with standard message
+│   │   │   ├── reverter.ts           # Restore wing.geo to HEAD
+│   │   │   ├── clean-check.ts        # Working tree dirty detection
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   ├── knowledge-graph/              # KG update + detect-impact engine
+│   │   ├── src/
+│   │   │   ├── updater.ts
+│   │   │   ├── impact-detector.ts
+│   │   │   ├── interaction-discovery.ts
+│   │   │   ├── dead-zone-tracker.ts
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   ├── wiki/                         # Wiki compiler
+│   │   ├── src/
+│   │   │   ├── compiler.ts
+│   │   │   ├── sensitivity-article.ts
+│   │   │   ├── batch-summary-article.ts
+│   │   │   ├── interaction-article.ts
+│   │   │   ├── topology-article.ts
+│   │   │   └── index.ts
+│   │   └── package.json
+│   │
+│   └── gep/                          # GEP genome evolver
+│       ├── src/
+│       │   ├── evolver.ts
+│       │   ├── fitness.ts
+│       │   ├── operators.ts          # Mutation, crossover, selection
+│       │   ├── genome-schema.ts
+│       │   └── index.ts
+│       └── package.json
+│
+├── apps/
+│   ├── loop/                         # Main loop orchestrator (Node.js process)
+│   │   ├── src/
+│   │   │   ├── orchestrator.ts       # Stage state machine
+│   │   │   ├── agents/
+│   │   │   │   ├── mutation-agent.ts
+│   │   │   │   ├── mesh-agent.ts
+│   │   │   │   ├── solver-agent.ts
+│   │   │   │   ├── extraction-agent.ts
+│   │   │   │   ├── metric-agent.ts
+│   │   │   │   ├── keep-revert-agent.ts
+│   │   │   │   ├── wiki-agent.ts
+│   │   │   │   ├── kg-agent.ts
+│   │   │   │   └── gep-agent.ts
+│   │   │   ├── queue/
+│   │   │   │   └── bullmq-setup.ts
+│   │   │   └── main.ts
+│   │   └── package.json
+│   │
+│   ├── api/                          # REST API server (Fastify)
+│   │   ├── src/
+│   │   │   ├── routes/
+│   │   │   │   ├── health.ts
+│   │   │   │   ├── runs.ts
+│   │   │   │   ├── experiments.ts
+│   │   │   │   ├── knowledge-graph.ts
+│   │   │   │   ├── wiki.ts
+│   │   │   │   ├── swarm.ts
+│   │   │   │   └── operator.ts
+│   │   │   ├── middleware/
+│   │   │   │   ├── auth.ts
+│   │   │   │   └── rate-limit.ts
+│   │   │   ├── sse/
+│   │   │   │   └── swarm-stream.ts
+│   │   │   └── main.ts
+│   │   └── package.json
+│   │
+│   ├── dashboard/                    # React dashboard (Vite + TailwindCSS)
+│   │   ├── src/
+│   │   │   ├── components/
+│   │   │   │   ├── NodeGrid.tsx
+│   │   │   │   ├── MetricChart.tsx
+│   │   │   │   ├── RegionHeatmap.tsx
+│   │   │   │   ├── ExperimentLog.tsx
+│   │   │   │   └── GlobalBestBanner.tsx
+│   │   │   ├── hooks/
+│   │   │   │   └── useSwarmStream.ts
+│   │   │   ├── pages/
+│   │   │   │   ├── Overview.tsx
+│   │   │   │   ├── RunDetail.tsx
+│   │   │   │   └── ExperimentDetail.tsx
+│   │   │   └── main.tsx
+│   │   └── package.json
+│   │
+│   └── cli/                          # Operator CLI (Commander.js)
+│       ├── src/
+│       │   ├── commands/
+│       │   │   ├── start.ts
+│       │   │   ├── pause.ts
+│       │   │   ├── resume.ts
+│       │   │   ├── abort.ts
+│       │   │   ├── status.ts
+│       │   │   ├── run-history.ts
+│       │   │   └── export.ts
+│       │   └── main.ts
+│       └── package.json
+│
+├── infra/
+│   ├── docker/
+│   │   ├── Dockerfile.loop           # Loop process image
+│   │   ├── Dockerfile.api            # API server image
+│   │   ├── Dockerfile.su2            # SU2 + MPI image (pre-built binary)
+│   │   ├── Dockerfile.gmsh           # GMSH + Python image
+│   │   └── docker-compose.yml        # Full local dev stack
+│   │
+│   ├── k8s/                          # Kubernetes manifests
+│   │   ├── namespace.yaml
+│   │   ├── api-deployment.yaml
+│   │   ├── loop-statefulset.yaml     # Loop nodes as StatefulSet (stable IDs)
+│   │   ├── redis-deployment.yaml
+│   │   ├── postgres-statefulset.yaml
+│   │   ├── minio-deployment.yaml     # Local S3-compatible
+│   │   ├── hpa-loop.yaml             # HPA for loop node scaling
+│   │   └── ingress.yaml
+│   │
+│   ├── terraform/                    # Cloud infra (optional, AWS/GCP)
+│   │   ├── main.tf
+│   │   ├── rds.tf
+│   │   ├── elasticache.tf
+│   │   ├── s3.tf
+│   │   └── variables.tf
+│   │
+│   └── scripts/
+│       ├── bootstrap.sh              # First-time setup
+│       ├── seed-db.sh                # Seed parameter registry
+│       └── health-check.sh
+│
+├── geometry/
+│   └── wing.geo                      # THE ONLY MUTABLE FILE IN THE LOOP
+│
+├── .aeroloop/                        # Runtime state (gitignored except wiki/genome)
+│   ├── best_metric.json
+│   ├── knowledge_graph_summary.md    # committed
+│   ├── wiki/                         # committed
+│   ├── genome/                       # committed
+│   └── node_id                       # gitignored
+│
+├── hooks/
+│   ├── pre-commit                    # Reject commits touching non-wing.geo files
+│   │   │                               from loop process (checks GIT_AUTHOR env)
+│   └── commit-msg                    # Enforce standard commit message format
+│
+├── .github/
+│   └── workflows/
+│       ├── ci.yml
+│       ├── integration.yml
+│       └── release.yml
+│
+├── CLAUDE.md                         # Constitutional law (inviolable)
+├── AGENTS.md                         # Agent registry + message protocol
+├── program.md                        # High-level project programme
+├── Aeroloopspec.md                   # This document
+├── turbo.json                        # Turborepo config
+├── pnpm-workspace.yaml
+└── package.json
+INFRA-002 — Docker Compose (local dev stack)
+Services required (docker-compose.yml):
+
+Service	Image	Port	Notes
+postgres	postgres:15-alpine	5432	Persistent volume
+redis	redis:7-alpine	6379	Persistent AOF
+minio	minio/minio	9000	S3-compatible; console on 9001
+api	aeroloop/api:dev	4000	Hot-reload via tsx watch
+loop	aeroloop/loop:dev	–	Single node; env: NODE_ENV=dev
+dashboard	aeroloop/dashboard:dev	3000	Vite HMR
+bullmq-ui	bull-board	3001	Queue visibility
+Environment variables (all services read from .env):
+
+text
+
+DATABASE_URL=postgresql://aeroloop:secret@postgres:5432/aeroloop
+REDIS_URL=redis://redis:6379
+S3_ENDPOINT=http://minio:9000
+S3_BUCKET=aeroloop-results
+S3_ACCESS_KEY=minioadmin
+S3_SECRET_KEY=minioadmin
+SU2_BINARY=/usr/local/bin/SU2_CFD
+GMSH_PYTHON=/usr/local/bin/python3
+GEOMETRY_FILE=geometry/wing.geo
+KILL_TIMER_S=480
+GIT_AUTHOR_NAME=AeroLoopBot
+GIT_AUTHOR_EMAIL=bot@aeroloop.internal
+JWT_SECRET=changeme-in-production
+NODE_ENV=development
+LOG_LEVEL=info
+INFRA-003 — CI Pipeline Specification (.github/workflows/ci.yml)
+Triggers: push to any branch; pull_request to main.
+
+Jobs (must all pass for merge to main):
+
+Job 1: typecheck
+YAML
+
+- uses: actions/setup-node@v4 (node 20)
+- run: pnpm install --frozen-lockfile
+- run: pnpm turbo typecheck
+Job 2: lint
+YAML
+
+- run: pnpm turbo lint
+ESLint with @typescript-eslint + eslint-plugin-drizzle. Zero warnings policy: all warnings are treated as errors in CI.
+
+Job 3: unit-test
+YAML
+
+- run: pnpm turbo test
+Coverage thresholds (enforced in CI, fail build if not met):
+
+packages/geometry: 95% line coverage
+packages/extraction: 95% line coverage
+packages/git-ops: 100% line coverage
+packages/gep: 90% line coverage
+All other packages: 80% line coverage
+Job 4: integration-test
+YAML
+
+services: postgres, redis, minio (via docker-compose test profile)
+- run: pnpm turbo test:integration
+Integration tests must cover (at minimum):
+
+Full single experiment lifecycle (Stage 0–5 happy path)
+Timeout/kill timer fires and geometry is reverted
+Mesh quality failure halts solve
+DB append-only constraint rejects duplicate experiment_n
+Keep/revert git integrity (clean tree at start, committed on keep)
+Job 5: build
+YAML
+
+- run: pnpm turbo build
+All packages and apps must build without error.
+
+Job 6: docker-build
+Builds all Dockerfiles. Does not push (push only on release tag).
+
+INFRA-004 — Integration Test Specification
+IT-001: Single Experiment Happy Path
+Uses a known-good baseline .geo, mock SU2 outputs (pre-recorded), and real GMSH (in container). Verifies:
+
+Experiment record created with correct stage results
+Geometry SHA256 matches expected
+Mesh uploaded to S3 with matching SHA256
+Solver outputs uploaded to S3
+Composite metric within expected range ± 0.001
+KEEP decision triggers git commit with correct message format
+ExperimentRun.best_M updated
+IT-002: Kill Timer Integration
+Injects a mock SU2 that sleeps for KILL_TIMER_S + 60 seconds. Verifies:
+
+OS-level timeout fires within KILL_TIMER_S + 5 seconds
+BullMQ job is marked failed
+Geometry reverted to pre-mutation state (SHA256 matches original)
+Experiment record status = SOLVE_TIMEOUT
+Loop continues to next experiment
+IT-003: Mesh Quality Gate
+Injects a GMSH that produces a mesh with orthogonality < threshold. Verifies:
+
+MeshQualityAgent returns FAIL
+No SU2 config generated
+No solver started
+Experiment record status = MESH_QUALITY_FAIL
+Geometry reverted
+IT-004: DB Monotonicity Constraint
+Attempts to insert two experiments with same (run_id, experiment_n). Verifies: second insert returns 409; first record unchanged.
+
+IT-005: GEP Trigger
+Runs 500 mock experiments via seeded DB state (no actual CFD). Verifies:
+
+GEP triggered at experiment_n = 500
+Loop pauses
+Genome file written to .aeroloop/genome/generation_1.json
+Genome committed to git
+Loop resumes
+IT-006: Swarm Region Non-Collision
+Starts 4 loop instances against shared Redis + DB. Verifies:
+
+At most one node holds each region at any time
+No wing.geo write conflicts (verified via git log)
+All experiment records in shared DB with distinct (node_id, experiment_n) tuples
+INFRA-005 — Release Pipeline (.github/workflows/release.yml)
+Trigger: push of tag matching v*.*.*.
+
+Steps:
+
+Run full CI (all jobs above)
+Build and push Docker images to registry with tag = git tag
+Generate changelog from conventional commits
+Create GitHub Release with changelog + Docker image references
+Deploy to staging k8s cluster (auto)
+Deploy to production k8s cluster (manual approval gate)
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-ENV-001 — ENVIRONMENT & CONFIGURATION SPECIFICATION
+File: specs/_global/environment.md
+───────────────────────────────────────────────────────────────────
+
+All configuration is injected via environment variables. No hardcoded values anywhere in the codebase. All variables are validated on startup via Zod schema; startup fails fast with a clear error if any required variable is missing or invalid.
+
+Configuration Schema (Zod, apps/loop & apps/api)
+TypeScript
+
+export const EnvSchema = z.object({
+  // Core
+  NODE_ENV: z.enum(['development', 'test', 'production']),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+
+  // Database
+  DATABASE_URL: z.string().url(),
+  DATABASE_POOL_MIN: z.coerce.number().default(2),
+  DATABASE_POOL_MAX: z.coerce.number().default(10),
+
+  // Redis
+  REDIS_URL: z.string().url(),
+  REDIS_KEY_PREFIX: z.string().default('aeroloop'),
+
+  // S3
+  S3_ENDPOINT: z.string().url(),
+  S3_BUCKET: z.string().min(1),
+  S3_ACCESS_KEY: z.string().min(1),
+  S3_SECRET_KEY: z.string().min(1),
+  S3_REGION: z.string().default('us-east-1'),
+
+  // Solver
+  SU2_BINARY: z.string().min(1),
+  KILL_TIMER_S: z.coerce.number().min(60).max(3600).default(480),
+  MPI_RANKS: z.coerce.number().min(1).max(256).default(8),
+  SU2_CONFIG_TEMPLATE_DIR: z.string().min(1),
+
+  // Meshing
+  GMSH_PYTHON: z.string().min(1),
+  AUTO_MESH_SCRIPT: z.string().min(1),
+  MESH_DEFAULT_LEVEL: z.enum(['coarse', 'medium', 'fine']).default('medium'),
+  Y_PLUS_TARGET: z.coerce.number().default(1.0),
+
+  // Geometry
+  GEOMETRY_FILE: z.string().min(1).default('geometry/wing.geo'),
+
+  // Git
+  GIT_AUTHOR_NAME: z.string().default('AeroLoopBot'),
+  GIT_AUTHOR_EMAIL: z.string().email().default('bot@aeroloop.internal'),
+
+  // Loop behaviour
+  CONSECUTIVE_FAIL_HALT: z.coerce.number().default(3),
+  GEP_TRIGGER_INTERVAL: z.coerce.number().default(500),
+  WIKI_COMPILE_INTERVAL: z.coerce.number().default(10),
+
+  // Swarm
+  SWARM_ENABLED: z.coerce.boolean().default(false),
+  NODE_ID_FILE: z.string().default('.aeroloop/node_id'),
+  SWARM_API_TIMEOUT_MS: z.coerce.number().default(5000),
+  SWARM_REGION_TTL_S: z.coerce.number().default(600),
+
+  // Auth (API server)
+  JWT_SECRET: z.string().min(32),
+  JWT_EXPIRY: z.string().default('24h'),
+
+  // Notifications
+  NOTIFICATION_WEBHOOK_URL: z.string().url().optional(),
+  NOTIFICATION_EMAIL: z.string().email().optional(),
+});
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-DM-002 — COMPLETE DATABASE SCHEMA
+File: specs/_global/data-model-complete.md
+───────────────────────────────────────────────────────────────────
+
+Tables
+experiment_runs
+SQL
+
+CREATE TABLE experiment_runs (
+  run_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_label           TEXT NOT NULL,
+  status              TEXT NOT NULL CHECK (status IN (
+                        'INITIALISING','RUNNING','PAUSED','COMPLETED','FAILED'
+                      )),
+  node_id             UUID NOT NULL,            -- primary/initiating node
+
+  -- Locked config (immutable after INITIALISING → RUNNING)
+  metric_weights      JSONB NOT NULL,
+  operating_conditions JSONB NOT NULL,
+  solver_config       JSONB NOT NULL,
+  mesh_config         JSONB NOT NULL,
+
+  -- Progress
+  total_experiments   INTEGER NOT NULL DEFAULT 0,
+  kept_count          INTEGER NOT NULL DEFAULT 0,
+  reverted_count      INTEGER NOT NULL DEFAULT 0,
+  timeout_count       INTEGER NOT NULL DEFAULT 0,
+  mesh_fail_count     INTEGER NOT NULL DEFAULT 0,
+
+  -- Best-so-far
+  best_M              DOUBLE PRECISION,
+  best_experiment_n   INTEGER,
+  best_geometry_sha256 TEXT,
+
+  -- GEP state
+  current_genome      JSONB,
+  gep_generation      INTEGER NOT NULL DEFAULT 0,
+  gep_in_progress     BOOLEAN NOT NULL DEFAULT FALSE,
+
+  -- Swarm
+  swarm_enabled       BOOLEAN NOT NULL DEFAULT FALSE,
+
+  -- Baseline
+  baseline_experiment_id UUID,
+
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+experiments
+SQL
+
+CREATE TABLE experiments (
+  experiment_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id              UUID NOT NULL REFERENCES experiment_runs(run_id),
+  experiment_n        INTEGER NOT NULL,
+  node_id             UUID NOT NULL,
+
+  -- Mutation
+  mutation_parameter_id TEXT NOT NULL,
+  mutation_value_before DOUBLE PRECISION NOT NULL,
+  mutation_value_after  DOUBLE PRECISION NOT NULL,
+  mutation_delta        DOUBLE PRECISION NOT NULL,
+  mutation_strategy     TEXT NOT NULL,
+  topology_mutation     BOOLEAN NOT NULL DEFAULT FALSE,
+
+  -- Geometry provenance
+  geometry_sha256_before TEXT NOT NULL,
+  geometry_sha256_after  TEXT,
+
+  -- Stage results
+  bounds_valid          BOOLEAN,
+  mesh_quality_ok       BOOLEAN,
+  mesh_cell_count       INTEGER,
+  mesh_s3_key           TEXT,
+  mesh_sha256           TEXT,
+  solve_converged       BOOLEAN,
+  solve_wall_time_s     DOUBLE PRECISION,
+  solve_timeout         BOOLEAN NOT NULL DEFAULT FALSE,
+  results_s3_key        TEXT,
+  results_sha256        TEXT,
+
+  -- Aerodynamic coefficients
+  cl                    DOUBLE PRECISION,
+  cd                    DOUBLE PRECISION,
+  cmy                   DOUBLE PRECISION,
+  ld_ratio              DOUBLE PRECISION,
+  cd_wave               DOUBLE PRECISION,
+  buffet_onset_alpha    DOUBLE PRECISION,
+
+  -- Metric
+  M                     DOUBLE PRECISION,
+  M_best_at_time        DOUBLE PRECISION,
+  delta_M               DOUBLE PRECISION,
+
+  -- Decision
+  status                TEXT NOT NULL CHECK (status IN (
+                          'PENDING','BOUNDS_FAIL','MESH_FAIL',
+                          'SOLVE_TIMEOUT','SOLVE_FAIL','EXTRACT_FAIL',
+                          'REVERTED','KEPT','ABORTED'
+                        )),
+  git_commit_hash       TEXT,
+
+  -- GEP context
+  genome_generation     INTEGER,
+
+  -- Timing
+  stage_timings         JSONB,       -- {bounds_ms, mesh_ms, solve_ms, extract_ms, decision_ms}
+  total_wall_time_s     DOUBLE PRECISION,
+
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE (run_id, experiment_n)      -- monotonicity + uniqueness constraint
+);
+
+-- Append-only enforcement via trigger
+CREATE OR REPLACE FUNCTION prevent_experiment_update()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    RAISE EXCEPTION 'experiments table is append-only';
+  END IF;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER experiments_append_only
+  BEFORE UPDATE OR DELETE ON experiments
+  FOR EACH ROW EXECUTE FUNCTION prevent_experiment_update();
+knowledge_graph_entries
+SQL
+
+CREATE TABLE knowledge_graph_entries (
+  entry_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id              UUID REFERENCES experiment_runs(run_id),
+  parameter_id        TEXT NOT NULL,
+  experiment_n        INTEGER NOT NULL,
+  node_id             UUID NOT NULL,
+  delta_value         DOUBLE PRECISION NOT NULL,
+  delta_M             DOUBLE PRECISION NOT NULL,
+  outcome             TEXT NOT NULL CHECK (outcome IN ('KEPT','REVERTED',
+                        'TIMEOUT','MESH_FAIL','BOUNDS_FAIL')),
+  mesh_quality_ok     BOOLEAN,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX kg_param_run ON knowledge_graph_entries(parameter_id, run_id);
+knowledge_graph_sensitivities
+SQL
+
+CREATE TABLE knowledge_graph_sensitivities (
+  sensitivity_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id              UUID REFERENCES experiment_runs(run_id),
+  parameter_id        TEXT NOT NULL,
+  sensitivity_score   DOUBLE PRECISION NOT NULL,
+  direction           TEXT CHECK (direction IN ('positive','negative','neutral')),
+  confidence          DOUBLE PRECISION NOT NULL,
+  sample_count        INTEGER NOT NULL,
+  dead_zone           BOOLEAN NOT NULL DEFAULT FALSE,
+  hot_zone            BOOLEAN NOT NULL DEFAULT FALSE,
+  computed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (run_id, parameter_id)  -- upserted after each experiment
+);
+knowledge_graph_interactions
+SQL
+
+CREATE TABLE knowledge_graph_interactions (
+  interaction_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id              UUID REFERENCES experiment_runs(run_id),
+  param_a             TEXT NOT NULL,
+  param_b             TEXT NOT NULL,
+  interaction_strength DOUBLE PRECISION NOT NULL,
+  p_value             DOUBLE PRECISION NOT NULL,
+  direction           TEXT CHECK (direction IN ('synergistic','antagonistic','neutral')),
+  sample_count        INTEGER NOT NULL,
+  discovered_at_exp   INTEGER NOT NULL,
+  computed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (run_id, param_a, param_b)
+);
+wiki_articles
+SQL
+
+CREATE TABLE wiki_articles (
+  article_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id              UUID REFERENCES experiment_runs(run_id),
+  title               TEXT NOT NULL,
+  type                TEXT NOT NULL CHECK (type IN (
+                        'SENSITIVITY','BATCH_SUMMARY',
+                        'INTERACTION','TOPOLOGY'
+                      )),
+  experiment_range_start INTEGER,
+  experiment_range_end   INTEGER,
+  referenced_parameters  TEXT[],
+  referenced_experiments INTEGER[],
+  file_path           TEXT NOT NULL,
+  body_markdown       TEXT NOT NULL,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+swarm_nodes
+SQL
+
+CREATE TABLE swarm_nodes (
+  node_id             UUID PRIMARY KEY,
+  run_id              UUID REFERENCES experiment_runs(run_id),
+  hostname            TEXT NOT NULL,
+  status              TEXT NOT NULL CHECK (status IN (
+                        'ACTIVE','IDLE','SOLVING','GEP','STALE','OFFLINE'
+                      )),
+  current_region      TEXT,
+  local_best_M        DOUBLE PRECISION,
+  experiment_n        INTEGER,
+  core_count          INTEGER,
+  memory_gb           DOUBLE PRECISION,
+  gpu_available       BOOLEAN DEFAULT FALSE,
+  last_heartbeat      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  registered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deregistered_at     TIMESTAMPTZ
+);
+Database Indexes
+SQL
+
+-- High-frequency query paths
+CREATE INDEX exp_run_n      ON experiments(run_id, experiment_n DESC);
+CREATE INDEX exp_run_status ON experiments(run_id, status);
+CREATE INDEX exp_node       ON experiments(node_id);
+CREATE INDEX exp_kept       ON experiments(run_id) WHERE status = 'KEPT';
+CREATE INDEX wiki_run_type  ON wiki_articles(run_id, type);
+CREATE INDEX swarm_run      ON swarm_nodes(run_id, status);
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-MSG-001 — COMPLETE MESSAGE PROTOCOL
+File: specs/_global/messages.md
+───────────────────────────────────────────────────────────────────
+
+LoopMessage Base Type
+TypeScript
+
+interface LoopMessage {
+  message_id:     string;       // UUID v4
+  run_id:         string;       // UUID v4
+  experiment_n:   number;       // monotonic integer
+  node_id:        string;       // UUID v4
+  timestamp:      string;       // ISO 8601 UTC
+  message_type:   MessageType;
+  stage:          Stage;
+  payload:        Record<string, unknown>;
+  error?:         { code: string; message: string; stack?: string };
+}
+MessageType Enum (complete)
+TypeScript
+
+enum MessageType {
+  // Loop lifecycle
+  LOOP_START                = 'LOOP_START',
+  LOOP_PAUSE                = 'LOOP_PAUSE',
+  LOOP_RESUME               = 'LOOP_RESUME',
+  LOOP_HALT_DIRTY_TREE      = 'LOOP_HALT_DIRTY_TREE',
+  LOOP_CONSECUTIVE_FAIL     = 'LOOP_CONSECUTIVE_FAIL',
+
+  // Stage 0: Init
+  RUN_INITIALISED           = 'RUN_INITIALISED',
+  BASELINE_COMPLETE         = 'BASELINE_COMPLETE',
+  BASELINE_FAILED           = 'BASELINE_FAILED',
+
+  // Stage 1: Mutation
+  MUTATION_PROPOSAL         = 'MUTATION_PROPOSAL',
+  BOUNDS_VALID              = 'BOUNDS_VALID',
+  BOUNDS_INVALID            = 'BOUNDS_INVALID',
+  GEOMETRY_WRITTEN          = 'GEOMETRY_WRITTEN',
+  MUTATION_SKIPPED_DEAD_ZONE = 'MUTATION_SKIPPED_DEAD_ZONE',
+  MUTATION_SKIPPED_DUPLICATE = 'MUTATION_SKIPPED_DUPLICATE',
+
+  // Stage 2: Mesh
+  MESH_STARTED              = 'MESH_STARTED',
+  MESH_COMPLETE             = 'MESH_COMPLETE',
+  MESH_QUALITY_PASS         = 'MESH_QUALITY_PASS',
+  MESH_QUALITY_FAIL         = 'MESH_QUALITY_FAIL',
+  MESH_UPLOADED             = 'MESH_UPLOADED',
+
+  // Stage 3: Solve
+  SOLVE_STARTED             = 'SOLVE_STARTED',
+  SOLVE_CONVERGED           = 'SOLVE_CONVERGED',
+  SOLVE_UNCONVERGED         = 'SOLVE_UNCONVERGED',
+  SOLVE_TIMEOUT             = 'SOLVE_TIMEOUT',
+  SOLVE_FAILED              = 'SOLVE_FAILED',
+  RESULTS_UPLOADED          = 'RESULTS_UPLOADED',
+
+  // Stage 4: Extract + Metric
+  EXTRACTION_COMPLETE       = 'EXTRACTION_COMPLETE',
+  EXTRACTION_FAILED         = 'EXTRACTION_FAILED',
+  METRICS_COMPUTED          = 'METRICS_COMPUTED',
+  SANITY_WARNING            = 'SANITY_WARNING',
+
+  // Stage 5: Keep/Revert
+  EXPERIMENT_KEPT           = 'EXPERIMENT_KEPT',
+  EXPERIMENT_REVERTED       = 'EXPERIMENT_REVERTED',
+  EXPERIMENT_ABORTED        = 'EXPERIMENT_ABORTED',
+  GLOBAL_BEST_UPDATED       = 'GLOBAL_BEST_UPDATED',
+
+  // Stage 6: Wiki
+  WIKI_COMPILE_STARTED      = 'WIKI_COMPILE_STARTED',
+  WIKI_COMPILE_COMPLETE     = 'WIKI_COMPILE_COMPLETE',
+  WIKI_ARTICLE_CREATED      = 'WIKI_ARTICLE_CREATED',
+
+  // Stage 7: Knowledge Graph
+  KG_UPDATE_COMPLETE        = 'KG_UPDATE_COMPLETE',
+  KG_INTERACTION_DISCOVERED = 'KG_INTERACTION_DISCOVERED',
+  KG_DEAD_ZONE_DECLARED     = 'KG_DEAD_ZONE_DECLARED',
+  KG_HOT_ZONE_DECLARED      = 'KG_HOT_ZONE_DECLARED',
+
+  // Stage 8: GEP
+  GEP_EVOLUTION_START       = 'GEP_EVOLUTION_START',
+  GEP_EVOLUTION_COMPLETE    = 'GEP_EVOLUTION_COMPLETE',
+  GEP_EVOLUTION_FAILED      = 'GEP_EVOLUTION_FAILED',
+  TOPOLOGY_ENABLED          = 'TOPOLOGY_ENABLED',
+
+  // Stage 9: Swarm
+  NODE_REGISTERED           = 'NODE_REGISTERED',
+  NODE_HEARTBEAT            = 'NODE_HEARTBEAT',
+  NODE_STALE                = 'NODE_STALE',
+  NODE_DEREGISTERED         = 'NODE_DEREGISTERED',
+  REGION_CLAIMED            = 'REGION_CLAIMED',
+  REGION_RELEASED           = 'REGION_RELEASED',
+  REGION_CONFLICT_RESOLVED  = 'REGION_CONFLICT_RESOLVED',
+  SWARM_OFFLINE_MODE        = 'SWARM_OFFLINE_MODE',
+  SWARM_RECONNECTED         = 'SWARM_RECONNECTED',
+}
+Stage Enum
+TypeScript
+
+enum Stage {
+  INIT       = 0,
+  MUTATION   = 1,
+  MESH       = 2,
+  SOLVE      = 3,
+  EXTRACT    = 4,
+  DECISION   = 5,
+  WIKI       = 6,
+  KG         = 7,
+  GEP        = 8,
+  SWARM      = 9,
+}
+BullMQ Queue Layout
+text
+
+Queue: aeroloop-{run_id}-core
+  Jobs: MUTATION, MESH, SOLVE, EXTRACT, DECISION (serial, per experiment)
+
+Queue: aeroloop-{run_id}-background
+  Jobs: KG_UPDATE, WIKI_COMPILE, SWARM_SYNC (parallel, non-blocking)
+
+Queue: aeroloop-{run_id}-gep
+  Jobs: GEP_EVOLUTION (serial, blocking loop during execution)
+
+Queue: aeroloop-swarm-heartbeat
+  Jobs: NODE_HEARTBEAT (repeated, every 30s per node)
+Job options (core queue):
+
+TypeScript
+
+{
+  attempts: 1,           // never retry core jobs; always revert and move on
+  timeout: (KILL_TIMER_S + 60) * 1000,  // application-level backstop
+  removeOnComplete: 200, // keep last 200 completed job records
+  removeOnFail: 500,
+}
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-COMMIT-001 — GIT COMMIT MESSAGE SPECIFICATION
+File: specs/_global/commit-format.md
+───────────────────────────────────────────────────────────────────
+
+All loop-generated commits MUST match the following format exactly. The commit-msg git hook enforces this for commits authored by GIT_AUTHOR_NAME (AeroLoopBot).
+
+KEEP commit
+text
+
+exp({experiment_n}): keep {parameter_id} {before} → {after} | M={M_new:.6f} Δ={delta_M:+.6f}
+
+run_id: {run_id}
+node_id: {node_id}
+geometry_sha256_before: {sha256_before}
+geometry_sha256_after:  {sha256_after}
+mesh_sha256: {mesh_sha256}
+results_sha256: {results_sha256}
+cl={cl:.4f} cd={cd:.4f} ld={ld:.4f}
+solve_wall_time_s={solve_wall_time_s:.1f}
+strategy={strategy}
+genome_generation={genome_generation}
+Example:
+
+text
+
+exp(0144): keep taper_ratio 0.410 → 0.380 | M=0.882100 Δ=+0.003200
+
+run_id: a1b2c3d4-...
+node_id: e5f6g7h8-...
+...
+GEP genome commit
+text
+
+chore(gep): generation {N} evolved at exp {experiment_n}
+
+run_id: {run_id}
+fitness_before: {fitness:.4f}
+fitness_after:  {fitness:.4f}
+strategy_before: {strategy}
+strategy_after:  {strategy}
+population_size: 12
+Wiki compile commit
+text
+
+docs(wiki): batch {start_n}–{end_n} compiled | {article_count} articles
+
+run_id: {run_id}
+articles: [{list of article titles}]
+Hook implementation (hooks/commit-msg):
+Bash
+
+#!/usr/bin/env bash
+# Only enforce format for AeroLoopBot commits
+if [ "$GIT_AUTHOR_NAME" = "AeroLoopBot" ]; then
+  COMMIT_MSG=$(cat "$1")
+  if ! echo "$COMMIT_MSG" | grep -qE \
+    '^(exp\([0-9]+\):|chore\(gep\):|docs\(wiki\):)'; then
+    echo "ERROR: AeroLoopBot commit message does not match spec format."
+    exit 1
+  fi
+fi
+exit 0
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-METRIC-001 — COMPOSITE METRIC SPECIFICATION (COMPLETE)
+File: specs/_global/metric.md
+───────────────────────────────────────────────────────────────────
+
+Metric Definition
+The composite metric M is the single scalar used for all keep/revert decisions. It is defined once per run in ExperimentRun.metric_weights and is immutable for the duration of the run.
+
+Base formula (with buffet data available)
+text
+
+M = w_ld  × norm(L/D)
+  + w_buffet × norm(buffet_margin_deg)
+  + w_wave   × norm(1 - Cd_wave / Cd_total)
+Where norm(x) = x / x_baseline (ratio to baseline value). If baseline value is 0 for any term, that term is excluded and weights are renormalised to sum to 1.0.
+
+Fallback (no buffet data — alpha sweep not run)
+w_buffet is distributed proportionally to w_ld and w_wave:
+
+text
+
+w_ld_adj  = w_ld  + w_buffet × (w_ld  / (w_ld + w_wave))
+w_wave_adj = w_wave + w_buffet × (w_wave / (w_ld + w_wave))
+M = w_ld_adj × norm(L/D) + w_wave_adj × norm(1 - Cd_wave / Cd_total)
+Weight constraints (enforced at run creation):
+All weights ≥ 0.0
+Sum of weights = 1.0 ± 0.001
+w_ld ≥ 0.3 (L/D must always be a meaningful component)
+Wave drag computation
+Primary method (SU2 far-field decomposition, if available in solver output):
+
+text
+
+Cd_wave = Cd_total - Cd_induced - Cd_viscous
+Fallback (if far-field decomposition unavailable):
+
+text
+
+Cd_induced ≈ CL² / (π × AR × e)     [e = Oswald efficiency, default 0.85]
+Cd_viscous ≈ Cf × (1 + 1.2×(t/c) + 100×(t/c)⁴) × S_wet/S_ref
+Cd_wave = max(0, Cd_total - Cd_induced - Cd_viscous)
+Sanity bounds (warn, do not halt):
+Coefficient	Warn if outside
+CL	[-0.5, 3.0]
+CD	[0.001, 0.5]
+L/D	[0, 80]
+CMy	[-1.0, 1.0]
+Cd_wave	< 0 (clamp to 0)
+Metric version
+Each ExperimentRun records metric_version = "1.0". Any change to the metric formula requires a version bump and a new run; never retroactively re-score old experiments.
+
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-MESH-QUALITY-001 — MESH QUALITY THRESHOLDS SPECIFICATION
+File: specs/_global/mesh-quality.md
+───────────────────────────────────────────────────────────────────
+
+Quality Gates (all must pass for MESH_QUALITY_PASS)
+Metric	Threshold	Fail condition
+Min orthogonal quality	≥ 0.15	any cell below 0.15
+Max skewness	≤ 0.85	any cell above 0.85
+y+ (first cell, 95th %ile)	≤ 5.0	95th percentile > 5
+y+ target (mean)	0.5 – 2.0	mean outside range
+Cell count	within ±30% of target	outside range
+Negative volume cells	0	any < 0
+Max aspect ratio	≤ 5000	any cell above 5000
+Mesh Level Targets
+Level	Target cell count	BL layers	Growth rate
+coarse	500k – 1.5M	20	1.20
+medium	1.5M – 4M	30	1.15
+fine	4M – 10M	40	1.10
+Quality Report Format
+MeshQualityAgent must write a quality report to .aeroloop/mesh_quality_exp_{N}.json:
+
+JSON
+
+{
+  "experiment_n": 144,
+  "passed": true,
+  "metrics": {
+    "min_orthogonal_quality": 0.31,
+    "max_skewness": 0.71,
+    "y_plus_95th": 1.8,
+    "y_plus_mean": 0.94,
+    "cell_count": 2140000,
+    "cell_count_target": 2000000,
+    "negative_volume_cells": 0,
+    "max_aspect_ratio": 1240
+  },
+  "failures": []
+}
+───────────────────────────────────────────────────────────────────
+
+OPERATOR-001 — OPERATOR RUNBOOK
+File: specs/operator/runbook.md
+───────────────────────────────────────────────────────────────────
+
+Starting a run (single node)
+Bash
+
+# 1. Ensure git working tree is clean
+git status   # must show "nothing to commit"
+
+# 2. Validate environment
+pnpm cli status --check-env
+
+# 3. Start the loop
+pnpm cli start \
+  --run-label "naca0012-sweep-001" \
+  --mach 0.78 \
+  --reynolds 4.5e7 \
+  --alpha 2.5 \
+  --w-ld 0.5 \
+  --w-buffet 0.3 \
+  --w-wave 0.2 \
+  --kill-timer 480
+
+# 4. Monitor
+open http://localhost:3000   # dashboard
+pnpm cli status              # CLI status summary
+Starting a swarm run (N nodes)
+Bash
+
+# On coordinator node (also runs the API server):
+pnpm cli start --swarm --nodes 4 --run-label "sweep-swarm-001" [options]
+
+# On each worker node (different machines or containers):
+SWARM_ENABLED=true \
+NODE_COORDINATOR_URL=http://coordinator:4000 \
+pnpm cli start --join-run {run_id}
+Pausing a run
+Bash
+
+pnpm cli pause --run-id {run_id} [--node-id {node_id}|--all]
+# Loop pauses after current experiment completes (not mid-stage)
+Resuming a run
+Bash
+
+pnpm cli resume --run-id {run_id} [--node-id {node_id}|--all]
+Aborting the current experiment
+Bash
+
+pnpm cli abort-experiment --run-id {run_id} --node-id {node_id}
+# Kill timer fires immediately; geometry reverted; loop continues
+Exporting results
+Bash
+
+# Export all KEPT experiments as CSV
+pnpm cli export --run-id {run_id} --format csv --output ./results.csv
+
+# Export full experiment history as JSON
+pnpm cli export --run-id {run_id} --format json --output ./full_history.json
+
+# Export knowledge graph summary
+pnpm cli export --run-id {run_id} --type kg --output ./kg_summary.json
+Recovering from a dirty working tree halt
+Bash
+
+# The loop halts and emits LOOP_HALT_DIRTY_TREE if it detects uncommitted changes
+# to any file other than wing.geo.
+# Resolution:
+git stash         # or git checkout -- .
+git status        # must be clean
+pnpm cli resume --run-id {run_id}
+Recovering from coordinator loss (swarm)
+Bash
+
+# Nodes enter OFFLINE_MODE automatically.
+# Restart coordinator:
+docker compose restart api
+# Nodes detect reconnect via next heartbeat cycle (≤ 30s) and re-register.
+# Check accumulated offline records synced:
+pnpm cli status --run-id {run_id} --check-sync
+Monitoring key metrics (CLI)
+Bash
+
+pnpm cli status --run-id {run_id}
+# Output:
+# Run:         naca0012-sweep-001 (RUNNING)
+# Experiments: 144 total | 41 kept (28.5%) | 3 timeouts | 2 mesh fails
+# Best M:      0.8821 @ exp-138
+# Rate:        8.2 experiments/hour (rolling 1h)
+# Consecutive fails: 0
+# GEP:         generation 0 | next at exp 500
+# Active nodes: 1
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-TEST-001 — TESTING PHILOSOPHY & PATTERNS
+File: specs/_global/testing.md
+───────────────────────────────────────────────────────────────────
+
+Testing principles
+Unit tests own correctness of pure logic. All pure functions (metric computation, bounds checking, genome operators, wave drag formula, buffet detection) must have exhaustive unit test coverage with known-good values from reference aerodynamics data.
+
+Integration tests own the pipeline contracts. Each stage boundary (e.g., mesh → quality → solver) is tested end-to-end with real GMSH and mocked SU2 (pre-recorded output), or real SU2 on CI runners with a budget geometry (fast-solving airfoil).
+
+Git integrity tests are non-negotiable. Every test that touches keep/revert must assert: SHA256 before == SHA256 after revert, and commit message format validity on keep.
+
+No test may use sleep() or wall-clock assertions for correctness. Use injected timers / fake clocks for kill-timer tests.
+
+Test data is fixed, versioned, and committed. Reference meshes and solver outputs live in packages/extraction/fixtures/ and packages/meshing/fixtures/. Never regenerate them silently.
+
+Naming convention
+text
+
+packages/{name}/tests/
+  unit/
+    {module}.test.ts
+  integration/
+    {module}.integration.test.ts
+apps/{name}/tests/
+  e2e/
+    {scenario}.e2e.test.ts
+Test environment
+Vitest as the test runner (all packages and apps).
+@testcontainers/postgresql and @testcontainers/redis for integration tests that need real DB/Redis.
+S3 mocked via minio testcontainer or @aws-sdk/client-s3 mock.
+SU2 mocked via MockSU2Runner injectable (same interface as real SU2Runner; returns pre-recorded fixture outputs).
+GMSH runs real in integration tests; coarse mesh only for speed.
+───────────────────────────────────────────────────────────────────
+
+GLOBAL-LOGGING-001 — STRUCTURED LOGGING SPECIFICATION
+File: specs/_global/logging.md
+───────────────────────────────────────────────────────────────────
+
+All log output is structured JSON (using pino). No plain-text log statements allowed in production code.
+
+Required fields on every log line
+JSON
+
+{
+  "level": "info",
+  "time": "2025-01-15T14:32:01.123Z",
+  "service": "loop|api|dashboard|cli",
+  "run_id": "uuid-v4",
+  "experiment_n": 144,
+  "node_id": "uuid-v4",
+  "stage": 2,
+  "message": "Mesh quality check passed",
+  "...additional context fields..."
+}
+Required log events (loop process)
+Event	Level	Required context fields
+Experiment start	info	experiment_n, mutation_parameter_id, delta
+Bounds check result	info	valid, parameter_id, value, bounds
+Mesh started	info	level, cell_count_target
+Mesh quality result	info	passed, all quality metrics
+Solve started	info	config_hash, mpi_ranks, kill_timer_s
+Solve timeout	warn	wall_time_s, kill_timer_s
+Solve converged	info	wall_time_s, final_residual, iterations
+Metric computed	info	M, cl, cd, ld, cd_wave, buffet_onset_alpha
+KEEP decision	info	M_new, M_best, delta_M, git_commit_hash
+REVERT decision	info	M_new, M_best, delta_M
+Consecutive fail count	warn	consecutive_fail_count, threshold
+Dirty tree halt	error	dirty_files: string[]
+GEP start	info	generation, experiment_n, genome_summary
+KG interaction discovered	info	param_a, param_b, p_value, strength
+Dead zone declared	warn	parameter_id, attempts, region
+Log retention
+Development: stdout only
+Production: ship to configured log aggregator (Loki/ELK); retain 90 days
+Experiment decision logs (KEPT/REVERTED) are also appended to .aeroloop/decision_log.jsonl locally (human-readable audit trail)
+───────────────────────────────────────────────────────────────────
+
+IMPLEMENTATION ROADMAP
+File: program.md (completion)
+───────────────────────────────────────────────────────────────────
+
+Phase 0 — Foundation (Week 1–2)
+Goal: working monorepo skeleton with all shared types, DB schema, and git integrity primitives.
+
+ pnpm workspace + Turborepo setup
+ packages/types — all Zod schemas, compiled and exported
+ packages/db — Drizzle schema, migrations, append-only trigger
+ packages/redis — client + key helpers + SETNX claim helpers
+ packages/git-ops — clean-check, keep, revert (100% tested)
+ packages/geometry — parameter registry, bounds checker, wing.geo parser (95% tested with full parameter set)
+ hooks/pre-commit + hooks/commit-msg — installed and tested
+ infra/docker-compose.yml — postgres, redis, minio running
+ CI pipeline (typecheck + lint + unit tests passing)
+Milestone gate: packages/git-ops integration test passes (clean-check + keep + revert cycle on real git repo with wing.geo).
+
+Phase 1 — Core Pipeline (Week 3–5)
+Goal: single experiment runs end-to-end (Stages 0–5) with real GMSH and mocked SU2.
+
+ packages/meshing — auto_mesh.py wrapper, quality checker, S3 upload with SHA256 (medium level only initially)
+ packages/solver — SU2Runner interface, MockSU2Runner, dual kill-timer implementation (OS + BullMQ), convergence check
+ packages/extraction — polar extractor, wave drag, metric computer (95% unit tested with reference aerodynamic data)
+ apps/loop — Stage 0–5 orchestrator, BullMQ core queue wired
+ apps/api — /runs, /experiments endpoints (POST + GET)
+ Integration tests IT-001 through IT-004 passing
+ Stage 0 baseline run completes end-to-end (mocked SU2)
+Milestone gate: 50-experiment run completes autonomously overnight with ≥1 KEEP, zero git integrity violations, and full append-only experiment history in DB.
+
+Phase 2 — Learning Layer (Week 6–8)
+Goal: knowledge graph, wiki, and informed mutations working.
+
+ packages/knowledge-graph — updater, impact detector, interaction discovery, dead/hot zone tracking
+ packages/wiki — sensitivity + batch + interaction article compilers (enforce "specific numbers + experiment refs" rule)
+ apps/api — /knowledge-graph and /wiki endpoints
+ apps/loop — Stages 6–7 wired into background queue
+ GeometryMutationAgent reads KG summary + wiki before proposing
+ Anti-repetition check (last 10 experiments) implemented
+ Integration test: KG interaction discovered at p < 0.05
+Milestone gate: 200-experiment run shows decreasing mutation attempts in declared dead zones (verifiable from experiment log).
+
+Phase 3 — Adaptive Strategy (Week 9–10)
+Goal: GEP evolver working; genome evolves after 500 experiments.
+
+ packages/gep — genome schema, fitness (history-only), mutation, crossover, selection (population = 12, elites = 3)
+ apps/loop — Stage 8 wired; loop pauses correctly at n%500==0
+ GEP integration test IT-005 passing
+ Topology macro-mutation gated correctly by topology_probability
+ Operator notification on GEP trigger
+Milestone gate: IT-005 passes; genome file committed with correct message format; loop resumes without manual intervention.
+
+Phase 4 — Swarm (Week 11–13)
+Goal: multi-node swarm running with non-collision and shared learning.
+
+ apps/api — /swarm endpoints + SSE stream
+ apps/loop — Stage 9 swarm guard wired; region claim/release
+ apps/dashboard — React dashboard with SSE consumer
+ apps/cli — all operator commands implemented
+ OFFLINE_MODE + reconnect implemented
+ Integration test IT-006 passing (4-node non-collision)
+ K8s manifests (loop StatefulSet, api Deployment, HPA)
+Milestone gate: 4-node swarm completes 500 experiments with zero git conflicts and all experiment records reconciled in shared DB.
+
+Phase 5 — Production Hardening (Week 14–16)
+Goal: production-ready system; real SU2 on real geometry.
+
+ Replace MockSU2Runner with real SU2 runner in all integration tests (using NACA 0012 airfoil as budget geometry — fast solve, known polars)
+ Full mesh level support (coarse / medium / fine)
+ Alpha sweep for buffet onset fully wired
+ Surrogate model interface (after 50 experiments) implemented (even if initial model is a simple linear regression)
+ Terraform (or k8s Helm chart) for cloud deployment
+ Release pipeline wired; v1.0.0 release tagged
+ Full operator runbook validated by running 1000-experiment unattended overnight test on real wing geometry
+Milestone gate: 1000-experiment autonomous run on real wing.geo shows monotonically non-decreasing best_M (no regressions), with < 5% experiment loss rate (timeout + mesh fail combined).
+
+───────────────────────────────────────────────────────────────────
+
+OPEN ITEMS & KNOWN GAPS (as of spec v1.0)
+File: specs/_global/open-items.md
+───────────────────────────────────────────────────────────────────
+
+These items are known to be underspecified and must be resolved before Phase 5 production hardening.
+
+ID	Area	Gap description	Proposed resolution
+OI-001	Surrogate model	Interface defined but algorithm not specified.	Use Gaussian Process Regression (GPR) via scikit-learn;
+retrain every 50 experiments; use only as advisory input
+to GeometryMutationAgent, not as a replacement for CFD.
+OI-002	Multi-objective	Current metric collapses to scalar M. Pareto front	Post-v1.0: add Pareto mode flag; store CL/CD/buffet as
+exploration not supported.	separate objectives; use NSGA-II as optional GEP strategy.
+OI-003	Turbulence model	SU2 config template uses SA model by default. k-ω SST	Add turbulence_model to solver_config; validate against
+may be more accurate for high-AoA buffet prediction.	reference polars for NACA 0012 at Mach 0.78.
+OI-004	3D vs 2D geometry	Spec assumes 3D wing.geo. No 2D airfoil mode defined.	Add `geometry_mode: '2D'
+single-section GMSH template and different SU2 BC.
+OI-005	Authentication	JWT auth specified but no user management defined.	For v1.0: single shared secret via env var. Post-v1.0:
+add user table + role (admin / read-only).
+OI-006	Knowledge graph merge	Last-write-wins for swarm KG merge may miss nuance	Post-v1.0: implement Bayesian update (weighted by
+when two nodes explore the same parameter from	sample count) instead of last-write-wins.
+different directions simultaneously.	
+OI-007	Cost model	No compute-cost tracking. Expensive swarm runs have	Add cost_usd field to ExperimentRecord; compute from
+no budget governor.	solve_wall_time_s × node_cost_per_hour (env var).
+OI-008	Wing parametrisation	wing.geo format assumed but not formally specified.	Publish GLOBAL-GEOM-002 wing.geo format spec defining
+GMSH .geo macro syntax, variable naming, and section IDs.
+OI-009	Restart / warm-start	Cold restart from mid-run defined only at loop level.	Specify explicit checkpoint file .aeroloop/checkpoint.json
+Solver restart (SU2 restart files) not yet specified.	carrying: last experiment_n, current genome, best SHA256.
+OI-010	Dashboard auth	Dashboard reads SSE stream; no auth in dev mode.	Add optional DASHBOARD_READ_TOKEN env var for staging.
+───────────────────────────────────────────────────────────────────
+
+SPEC CHANGELOG
+File: specs/_global/changelog.md
+───────────────────────────────────────────────────────────────────
+
+Version	Date	Author	Changes
+0.1	2025-01-01	knarayanareddy	Initial draft: Stages 0–8 core pipeline
+0.2	2025-01-08	knarayanareddy	Added GEP stage, constitutional law, message proto
+0.3	2025-01-12	knarayanareddy	Added knowledge graph, wiki, swarm constitutional
+1.0	2025-01-15	knarayanareddy	Completed: Stage 9, API contracts, DB schema,
+infra spec, metric spec, mesh quality spec,
+commit format, logging, testing, operator runbook,
+implementation roadmap, open items.
+<!-- END OF Aeroloopspec.md v1.0 -->
+text
+
+
+---
+
+## What was completed & why each section belongs here
+
+Here is a quick summary of every section added and the design rationale behind each:
+
+| Section | Why it was needed |
+|---|---|
+| **Stage 8 Acceptance Criteria (AC-GEP-001–006)** | The original spec had requirements but no testable acceptance criteria — without ACs, you can't call Stage 8 "done" |
+| **Stage 9 — Swarm Coordination (full)** | Only referenced in constitutional law; the actual FR, region model, shared sync, failure modes, and ACs were entirely absent |
+| **GLOBAL-API-001 — API Contracts** | Referenced by nearly every stage agent (`GET /knowledge-graph/summary`, `POST /experiments`, etc.) but never defined; without this no agent can be implemented correctly |
+| **GLOBAL-INFRA-001 — Infra & CI/CD** | The monorepo layout was sketched; the complete tree, Docker Compose, CI job specs, integration test specs, and release pipeline were missing — all required to build the system |
+| **GLOBAL-ENV-001 — Environment Config** | Environment variables referenced throughout (kill timer, S3, SU2 path, etc.) but never consolidated into a validated schema; without this startup validation is impossible |
+| **GLOBAL-DM-002 — Complete DB Schema** | Stage specs referenced DB fields; only partial schema was implied — the full SQL DDL, append-only trigger, indexes, and all tables (including KG, wiki, swarm) were missing |
+| **GLOBAL-MSG-001 — Complete Message Protocol** | Partial enum existed; the complete `MessageType` enum covering all 9 stages, the `Stage` enum, and BullMQ queue layout were needed for the orchestrator state machine |
+| **GLOBAL-COMMIT-001 — Commit Format** | Referenced as a standard format throughout but never formally specified; the hook implementation enforcing it was absent |
+| **GLOBAL-METRIC-001 — Metric Spec** | The formula was partially described in Stage 4; a canonical, versioned, complete definition (including fallback, wave drag computation, sanity bounds, weight constraints) is needed as a single source of truth |
+| **GLOBAL-MESH-QUALITY-001 — Mesh Quality** | Thresholds were referenced but never formally tabulated in a single canonical spec |
+| **OPERATOR-001 — Runbook** | Essential for unattended operation; completely absent from the original |
+| **GLOBAL-TEST-001 — Testing Philosophy** | Needed to enforce consistency across packages (Vitest, testcontainers, fixture policy, naming convention) |
+| **GLOBAL-LOGGING-001 — Logging Spec** | Pino structured logging was implied; field requirements and required event table were needed for observability |
+| **Implementation Roadmap (program.md)** | Phases 0–5 with milestone gates translate the spec into an actionable build order with clear "done" criteria per phase |
+| **Open Items** | Honest spec engineering requires cataloguing known gaps so they aren't silently ignored during implementation |
+| **Changelog** | Required for any versioned spec document |
+
+
+
