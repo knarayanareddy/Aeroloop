@@ -124,7 +124,7 @@ aeroloop/
 │   └── shared/                              ← Types, utils, logger
 │
 ├── apps/
-│   ├── api/                                 ← FastAPI/Hono backend
+│   ├── api/                                 ← Hono backend (Bun runtime)
 │   ├── dashboard/                           ← Next.js real-time dashboard
 │   ├── cli/                                 ← Bun CLI (primary interface)
 │   └── worker/                              ← BullMQ job processor
@@ -191,8 +191,9 @@ application level (BullMQ job timeout). Both must be active.
 :::STRICT_REQUIREMENT:::
 RULE-003: THE GIT INTEGRITY LAW
 Every experiment produces EXACTLY ONE of two git outcomes:
-  SUCCESS (metric improved): git commit -m "exp-{N}: metric={val} delta=+{d} [KEEP]"
-  FAILURE (metric did not improve): git revert HEAD --no-edit (or git checkout wing.geo)
+  SUCCESS (metric improved): git commit -m "<must match RULE-060>"
+  FAILURE (metric did not improve): git checkout geometry/wing.geo (no commit is made)
+KEEP = commit, REVERT = checkout/restore only.
 No experiment may end without one of these two outcomes.
 No partial commits. No stashed changes. No uncommitted wing.geo.
 The git working tree MUST be clean at the start of every experiment.
@@ -243,7 +244,7 @@ RULE-011: TypeScript strict mode everywhere. Python: type-annotated,
 
 RULE-012: Cell dependency order (Turborepo enforced):
   shared → geometry-engine → cfd-runner → results-parser →
-  experiment-registry → knowledge-graph → gep-engine →
+  experiment-registry → knowledge-graph → surrogate → gep-engine →
   swarm-coordinator → wiki-engine → apps
   No reverse dependencies. No circular imports.
 
@@ -402,9 +403,9 @@ RULE-054: The Compression Loop runs after every implementation:
 ## 🔄 ARTICLE VII: GIT & DEPLOYMENT
 
 RULE-060: Commit format for experiments (INVIOLABLE):
-  "exp-{N}: L/D={val:.3f} Cd={val:.5f} delta={+/-val:.3f} [{KEEP|REVERT}]
+  "exp-{N}: M={M_new:.4f} delta={+/-delta:.4f} L/D={cl_cd:.2f} [{KEEP|REVERT}]
    mutation: {parameter}={old_val}→{new_val}
-   mesh: {cell_count} cells | solve: {wall_time}s | converged: {bool}"
+   mesh: {cell_count} cells | solve: {wall_time}s | convg: {residual_orders:.1f}ord"
 
 RULE-061: Branch naming: feature/AL-{ticket}-{slug}
   Experiment commits go on the active run branch: run/{run_id}
@@ -442,7 +443,7 @@ Markdown
 | CFDSolverAgent         | 3     | su2_runner (kill: 8 min)  | 9 min       |
 | PolarsExtractorAgent   | 4     | su2_output_parser         | 2 min       |
 | MetricComputerAgent    | 4     | composite_metric_calc     | 1 min       |
-| KeepRevertAgent        | 5     | git_commit / git_revert   | 2 min       |
+| KeepRevertAgent        | 5     | git_commit / git_checkout_restore | 2 min       |
 
 ### Background Agents (non-blocking)
 | Agent ID               | Trigger            | Max Runtime |
@@ -1188,9 +1189,25 @@ export const parameterSensitivities = pgTable('parameter_sensitivities', {
   interactions: jsonb('interactions').notNull().default('[]'),
   last_updated_experiment_n: integer('last_updated_experiment_n'),
   updated_at: timestamp('updated_at').notNull().defaultNow(),
-}, (table) => ({
-  uniq: unique().on(table.run_id, table.parameter),
 }));
+
+export const genomes = pgTable('genomes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  run_id: uuid('run_id').notNull().references(() => experimentRuns.id),
+  generation: integer('generation').notNull(),
+  genome_id: text('genome_id').notNull().unique(),
+  fitness_score: real('fitness_score').notNull(),
+  mutation_strategy: text('mutation_strategy').notNull(),
+  parameter_weights: jsonb('parameter_weights').notNull(),
+  step_size_multiplier: real('step_size_multiplier').notNull(),
+  local_search_patience: integer('local_search_patience').notNull(),
+  coarse_search_patience: integer('coarse_search_patience').notNull(),
+  topology_probability: real('topology_probability').notNull(),
+  parent_genome_ids: jsonb('parent_genome_ids').notNull().default('[]'),
+  is_active: boolean('is_active').notNull().default(false),
+  created_at: timestamp('created_at').notNull().defaultNow(),
+  activated_at: timestamp('activated_at'),
+});
 text
 
 
@@ -1433,6 +1450,8 @@ FR-0-006: If the operator requests swarm mode (SWARM_ENABLED=true):
   4. Verify all other nodes are registered before allowing any node to start
   Design space partitioning strategy: divide parameter space into N
   equal-volume hypercubes (N = SWARM_TOTAL_NODES).
+  Enforcement: Nodes MUST claim hypercube regions via SwarmCoordinator
+  claims (SETNX), per Rule-006, to prevent overlap during runtime.
 
 FR-0-007: KnowledgeGraph seeding with known interactions:
   Load all pre-defined interactions from geometry-parameter-registry.md
@@ -3315,6 +3334,34 @@ tests:
     name: "Loop pauses during GEP evolution"
     expected:
       new_experiments_during_gep: 0
+  - id: AC-8-002
+    name: "Population composition"
+    expected:
+      population_size: 16
+      includes_active_genome: true
+  - id: AC-8-003
+    name: "Elitism persistence"
+    expected:
+      top_2_preserved: true
+  - id: AC-8-004
+    name: "Selection source breakdown"
+    expected:
+      breakdown: "2 elite + 4 crossover + 8 mutant + 2 random"
+      total: 16
+  - id: AC-8-005
+    name: "Fitness evaluation resources"
+    expected:
+      new_cfd_jobs: 0
+      use_history_only: true
+  - id: AC-8-006
+    name: "Cold-start fitness estimation"
+    expected:
+      fallback_to_surrogate: true
+  - id: AC-8-007
+    name: "Generation persistence"
+    expected:
+      stored_in_genomes_table: true
+      generation_incremented: true
       
 
 
